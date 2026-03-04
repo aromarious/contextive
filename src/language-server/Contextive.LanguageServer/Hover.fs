@@ -68,24 +68,29 @@ module private Filtering =
     // Singularize). Singularize is a no-op for CJK text in Humanizer, so the
     // normalisation is effectively NFKD + lowercase on both sides.
     // cursorOffsetInToken restricts matches to keys that span the cursor position.
-    let findMatchingTermsBySubstring (context: GlossaryFile.Context) (token: string) (cursorOffsetInToken: int) =
+    let findMatchingTermsBySubstring (context: GlossaryFile.Context) (token: string) (cursorOffsetInToken: int) (matchRange: (int * int) option ref) =
         let normalizedToken = Normalization.simpleNormalize token
 
         context.Index.Keys
         |> Seq.filter (fun key ->
             let idx = normalizedToken.IndexOf(key)
-            idx >= 0 && cursorOffsetInToken >= idx && cursorOffsetInToken < idx + key.Length)
+            let matches = idx >= 0 && cursorOffsetInToken >= idx && cursorOffsetInToken < idx + key.Length
+
+            if matches && matchRange.Value.IsNone then
+                matchRange.Value <- Some(idx, key.Length)
+
+            matches)
         |> Seq.collect (fun key -> context.Index[key])
         |> Seq.distinctBy (fun t -> t.Name)
 
-    let termFilterForCandidateTermsWithIndex cursorOffsetInToken tokenAndCandidateTerms =
+    let termFilterForCandidateTermsWithIndex cursorOffsetInToken tokenAndCandidateTerms (matchRange: (int * int) option ref) =
         Seq.map (fun (c: GlossaryFile.Context) ->
 
             let token = tokenAndCandidateTerms |> Seq.head |> fst
 
             let terms =
                 if CandidateTerms.containsCJK token then
-                    findMatchingTermsBySubstring c token cursorOffsetInToken
+                    findMatchingTermsBySubstring c token cursorOffsetInToken matchRange
                 else
                     findMatchingTermsInIndex c tokenAndCandidateTerms
 
@@ -118,13 +123,14 @@ let private hoverContentForToken
     (tokensAndCandidateTerms: CandidateTerms.TokenAndCandidateTerms seq)
     =
     async {
-        let! findResult = termFinder uri (Filtering.termFilterForCandidateTermsWithIndex cursorOffsetInToken tokensAndCandidateTerms)
+        let matchRange = ref None
+        let! findResult = termFinder uri (Filtering.termFilterForCandidateTermsWithIndex cursorOffsetInToken tokensAndCandidateTerms matchRange)
 
         return
             if Seq.isEmpty findResult then
-                Lsp.noHoverResult
+                (Lsp.noHoverResult, None)
             else
-                hoverResult findResult
+                (hoverResult findResult, matchRange.Value)
     }
 
 let handler
@@ -152,9 +158,21 @@ let handler
 
                         dp
 
-                Some token
-                |> CandidateTerms.tokenToTokenAndCandidateTerms
-                |> hoverContentForToken uriPath termFinder cursorOffsetInToken
+                async {
+                    let! (hover, matchRange) =
+                        Some token
+                        |> CandidateTerms.tokenToTokenAndCandidateTerms
+                        |> hoverContentForToken uriPath termFinder cursorOffsetInToken
+
+                    return
+                        match matchRange with
+                        | Some(idx, len) when hover <> null ->
+                            Hover(
+                                Contents = hover.Contents,
+                                Range = Range(Position(p.Position.Line, tokenStart + idx), Position(p.Position.Line, tokenStart + idx + len))
+                            )
+                        | _ -> hover
+                }
     }
     |> Async.StartAsTask
 
